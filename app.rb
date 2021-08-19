@@ -1,50 +1,96 @@
-require 'open-uri'
-require 'sinatra'
-require "sinatra/reloader" if development?
+require "sinatra"
+require "omniauth"
+require "rspotify"
+require "rspotify/oauth"
 
-get '/' do
-  text = get_text("https://scrapbox.io/api/pages/ongaeshi/extensive_reading/text")
-  readings = parse_text(text)
-  total = readings.reduce(0) {|r, i| r + i.word_count}
-
-  unfinished = readings.find_all {|e| e.unfinish? }
-  sort_by_date = readings.find_all {|e| e.finish_date != nil }.sort_by {|e| e.finish_date }
-  start_date = sort_by_date.first.finish_date.strftime("%Y/%m/%d")
-  end_date = sort_by_date.last.finish_date.strftime("%Y/%m/%d")
-
-  days = (sort_by_date.last.finish_date - sort_by_date.first.finish_date) / 60 / 60 / 24
-  words_per_day = (total / days).to_i
-
-<<EOS
-#{total} words<br>
-#{readings.count} readings (#{unfinished.count} unfinished)<br>
-#{start_date}-#{end_date} (#{words_per_day} words/day) <br> 
-EOS
+def track_html(track)
+  image_url = track.album.images[2]["url"]
+  album_url = track.album.external_urls["spotify"]
+  artist = track.artists[0]
+  "<a href='#{album_url}'><img src='#{image_url}' /></a> <a href='#{track.external_urls["spotify"]}'>#{track.name}</a> #{artist.name} #{ms_to_time(track.duration_ms)}"
 end
 
-def get_text(url)
-  URI.open(url) do |f|
-    return f.read
+def ms_to_time(ms)
+  sec = ms / 1000
+  day = sec.to_i / 86400
+  (Time.parse("1/1") + (sec - day * 86400)).strftime("%M:%S")
+end
+
+RSpotify.authenticate(ENV["SPOTIFY_CLIENT_ID"], ENV["SPOTIFY_CLIENT_SECRET"])
+
+class MyApplication < Sinatra::Base
+  configure do
+    set :sessions, true
+    set :inline_templates, true
+  end
+
+  use OmniAuth::Builder do
+    provider :spotify, ENV["SPOTIFY_CLIENT_ID"], ENV["SPOTIFY_CLIENT_SECRET"], scope: "user-read-recently-played"
+  end
+
+  get "/" do
+    if session[:authenticated]
+      user = RSpotify::User.new(session[:omniauth_auth])
+      recently_played = user.recently_played(limit: 50)
+
+      erb <<~EOS
+        #{recently_played_html(recently_played)}
+        <a href="/logout">Logout</a><br>
+      EOS
+    else
+      erb <<~EOS
+        <form method='post' action='/auth/spotify'>
+          <input type="hidden" name="authenticity_token" value='#{request.env["rack.session"]["csrf"]}'>
+          <button type='submit'>Login with Spotify</button>
+        </form>
+      EOS
+    end
+  end
+
+  get "/auth/:provider/callback" do
+    session[:authenticated] = true
+    session[:omniauth_auth] = request.env["omniauth.auth"]
+    redirect "/"
+  end
+
+  get "/logout" do
+    session[:authenticated] = false
+    redirect "/"
+  end
+
+  def recently_played_html(recently_played)
+    body = recently_played.map do |track|
+      "<li>#{track_html(track)}</li>"
+    end.join("\n")
+
+    <<~EOS
+      <ol>
+        #{body}
+      </ol>
+    EOS
   end
 end
 
-class Reading
-  attr_reader :name, :word_count, :finish_date
+MyApplication.run! if __FILE__ == $0
 
-  def initialize(line)
-    data = line.split(" ")
-    @name = data[0..-3].join(" ")
-    @finish_date = Time.parse(data[-1]) rescue nil
-    @word_count = unfinish? ? 0 : data[-2].to_i
-  end
+__END__
 
-  def unfinish?
-    @finish_date.nil?
-  end
-end
-
-def parse_text(src)
-  src = src.split("\n")[1..-1]
-  src.delete_if {|e| e =~ /^#/}
-  src.map {|e| Reading.new(e) }
-end
+@@ layout
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-giJF6kkoqNQ00vy+HMDP7azOuL0xtbfIcaT9wjKHr8RbDVddVHyTfAAsrekwKmP1" crossorigin="anonymous">
+    <title>Spotify recently played</title>
+  </head>
+  <body>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/js/bootstrap.bundle.min.js" integrity="sha384-ygbV9kiqUc6oa4msXn9868pTtWMgiQaeYH7/t7LECLbyPA2x65Kgf80OJFdroafW" crossorigin="anonymous"></script>
+    <main class="container">
+      <div class="starter-template text-left py-5 px-3">
+        <h1>Spotify recently played</h1>
+        <%= yield %>
+      </div>
+    </main>
+  </body>
+</html>
